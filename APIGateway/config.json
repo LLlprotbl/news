@@ -1,0 +1,5 @@
+{
+  "news_service": "http://localhost:80",
+  "comments_service": "http://localhost:8081",
+  "port": ":8080"
+}
