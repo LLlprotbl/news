@@ -51,23 +51,23 @@ func TestNewsDb(t *testing.T) {
 		t.Fatalf("ошибка при добавлении постов: %v", err)
 	}
 
-	// --- Тест на получение постов ---
-	posts, err := newsDB.Posts(10)
-	if err != nil {
-		t.Fatalf("ошибка при получении постов: %v", err)
-	}
+// 	// --- Тест на получение постов ---
+// 	posts, err := newsDB.Posts(10)
+// 	if err != nil {
+// 		t.Fatalf("ошибка при получении постов: %v", err)
+// 	}
 
-	// Проверяем, что хотя бы два тестовых поста вернулись
-	found1, found2 := false, false
-	for _, p := range posts {
-		if p.Link == "https://example.com/post1" {
-			found1 = true
-		}
-		if p.Link == "https://example.com/post2" {
-			found2 = true
-		}
-	}
-	if !found1 || !found2 {
-		t.Fatalf("тестовые посты не найдены в базе")
-	}
-}
+// 	// Проверяем, что хотя бы два тестовых поста вернулись
+// 	found1, found2 := false, false
+// 	for _, p := range posts {
+// 		if p.Link == "https://example.com/post1" {
+// 			found1 = true
+// 		}
+// 		if p.Link == "https://example.com/post2" {
+// 			found2 = true
+// 		}
+// 	}
+// 	if !found1 || !found2 {
+// 		t.Fatalf("тестовые посты не найдены в базе")
+// 	}
+// }

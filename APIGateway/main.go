@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
+	"time"
 )
 
 type Config struct {
@@ -18,13 +22,25 @@ var cfg Config
 
 func init() {
 	cfg = Config{
-		NewsService:     "http://localhost:80",
-		CommentsService: "http://localhost:8081",
+		NewsService:     "http://localhost:80",   // Сервис новостей
+		CommentsService: "http://localhost:8081", // Сервис комментариев
 		Port:            ":8080",
 	}
 }
 
-// модели
+// Структуры ответа
+
+type NewsResponse struct {
+	News       []NewsShortDetailed `json:"news"`
+	Pagination Pagination          `json:"pagination"`
+}
+
+type Pagination struct {
+	TotalPages   int `json:"total_pages"`
+	CurrentPage  int `json:"current_page"`
+	ItemsPerPage int `json:"items_per_page"`
+}
+
 type NewsShortDetailed struct {
 	ID      int    `json:"id"`
 	Title   string `json:"title"`
@@ -48,200 +64,180 @@ type Comment struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// структура для канала
 type serviceResult struct {
 	data interface{}
 	err  error
 }
 
-// ------------------------------------------------------------------
-// Метод вывода списка новостей
-// GET /news
-func getNewsList(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// Запрашиваем 10 последних новостей у сервиса новостей
-	resp, err := http.Get(cfg.NewsService + "/news/10")
-	if err != nil {
-		http.Error(w, "news service error", http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-	var news []NewsShortDetailed
-	if err := json.NewDecoder(resp.Body).Decode(&news); err != nil {
-		http.Error(w, "error decoding news", http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, news)
+// Middleware
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
 }
 
-// Метод фильтра новостей
-// GET /news/filter?date=2025-12-18
-// пример http://localhost:8080/news/filter?s=редакции
-func filterNews(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func loggerMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := r.URL.Query().Get("request_id")
+		if len(reqID) < 6 {
+			reqID = fmt.Sprintf("req-%d", time.Now().UnixNano())
+		}
+		ctx := context.WithValue(r.Context(), "request_id", reqID)
+		w.Header().Set("X-Request-ID", reqID)
+
+		start := time.Now()
+		rw := &responseWriter{w, http.StatusOK}
+		next.ServeHTTP(rw, r.WithContext(ctx))
+
+		log.Printf("[%s] GATEWAY | %s %s | STATUS: %d | ID: %s | DUR: %v",
+			time.Now().Format("15:04:05"), r.Method, r.URL.Path, reqID, rw.statusCode, time.Since(start))
+	})
+}
+
+// Обработчики
+
+// GET /news
+func handleNews(w http.ResponseWriter, r *http.Request) {
+	reqID, _ := r.Context().Value("request_id").(string)
+	s := r.URL.Query().Get("s")
+	page := r.URL.Query().Get("page")
+	if page == "" {
+		page = "1"
 	}
 
-	// Извлекаем поисковое слово из запроса пользователя
-	searchQuery := r.URL.Query().Get("s")
-	if searchQuery == "" {
-		http.Error(w, "s query parameter is required", http.StatusBadRequest)
-		return
-	}
+	// Формируем URL к микросервису новостей
+	targetURL := fmt.Sprintf("%s/news?s=%s&page=%s&request_id=%s",
+		cfg.NewsService, url.QueryEscape(s), page, reqID)
 
-	// Пробрасываем запрос в News Service
-	safeQuery := url.QueryEscape(searchQuery)
-	targetURL := fmt.Sprintf("%s/news/search?s=%s", cfg.NewsService, safeQuery)
 	resp, err := http.Get(targetURL)
 	if err != nil {
-		http.Error(w, "news service error", http.StatusInternalServerError)
+		http.Error(w, "news service unreachable", http.StatusServiceUnavailable)
 		return
 	}
 	defer resp.Body.Close()
 
-	var news []NewsShortDetailed
-	if err := json.NewDecoder(resp.Body).Decode(&news); err != nil {
+	var data NewsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		http.Error(w, "error decoding news", http.StatusInternalServerError)
 		return
 	}
-
-	writeJSON(w, news)
+	writeJSON(w, data)
 }
 
-// Метод получения детальной новости
-// GET /news/{id}
 func getNewsDetail(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	id := r.URL.Query().Get("id") // Получаем ID новости из запроса
+	reqID, _ := r.Context().Value("request_id").(string)
+	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "id is required", http.StatusBadRequest)
 		return
 	}
 
-	// Канал с буфером = количеству запросов
 	resChan := make(chan serviceResult, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Запрос к сервису новостей
+	// Запрос к новостям
 	go func() {
 		defer wg.Done()
-
-		// Формируем URL сервис новостей на :80 имеет эндпоинт /news/detail
-		url := fmt.Sprintf("http://localhost:80/news/detail/%s", id)
-		// Выполняем запрос
-		resp, err := http.Get(url)
-		if err != nil {
-			resChan <- serviceResult{err: err}
-			return
-		}
-		// Закрываем поток после завершения функции
-		defer resp.Body.Close()
-		// JSON из resp.Body в слайс []Comment
-		var news NewsFullDetailed
-		// Создаем декодер из тела ответа и сразу вызываем расшифровку
-		err = json.NewDecoder(resp.Body).Decode(&news)
-		if err != nil {
-			resChan <- serviceResult{err: err}
-			return
-		}
-		// Мы отправляем в канал данные с типом NewsFullDetailed
-		resChan <- serviceResult{data: news}
-	}()
-
-	// Горутина для сервиса комментариев (SQLite)
-	go func() {
-		defer wg.Done()
-		url := fmt.Sprintf("http://localhost:8081/comments?news_id=%s", id)
+		url := fmt.Sprintf("%s/news/%s?request_id=%s", cfg.NewsService, id, reqID)
 		resp, err := http.Get(url)
 		if err != nil {
 			resChan <- serviceResult{err: err}
 			return
 		}
 		defer resp.Body.Close()
-		var comments []Comment
-		if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
+		var n NewsFullDetailed
+		json.NewDecoder(resp.Body).Decode(&n)
+		resChan <- serviceResult{data: n}
+	}()
+
+	// Запрос к комментариям
+	go func() {
+		defer wg.Done()
+		url := fmt.Sprintf("%s/comments?news_id=%s&request_id=%s", cfg.CommentsService, id, reqID)
+		resp, err := http.Get(url)
+		if err != nil {
 			resChan <- serviceResult{err: err}
 			return
 		}
-		resChan <- serviceResult{data: comments}
+		defer resp.Body.Close()
+		var c []Comment
+		json.NewDecoder(resp.Body).Decode(&c)
+		resChan <- serviceResult{data: c}
 	}()
 
-	// Ждём все горутины ===
 	wg.Wait()
 	close(resChan)
 
-	// Собираем итоговый результат ===
 	var result NewsFullDetailed
-
 	for res := range resChan {
 		if res.err != nil {
-			// Если хотя бы один запрос упал — возвращаем ошибку
-			http.Error(w, "service error", http.StatusInternalServerError)
+			http.Error(w, "internal service error", http.StatusInternalServerError)
 			return
 		}
-
 		switch v := res.data.(type) {
 		case NewsFullDetailed:
-			// Копируем данные новости (Title, Content, CreatedAt и т.д.)
-			result.ID = v.ID
-			result.Title = v.Title
-			result.Content = v.Content
-			result.PubTime = v.PubTime
+			result.ID, result.Title, result.Content, result.PubTime = v.ID, v.Title, v.Content, v.PubTime
 		case []Comment:
-			// Добавляем массив комментариев
 			result.Comments = v
 		}
 	}
-
 	writeJSON(w, result)
 }
 
-// Метод добавления комментария
-// POST /comments
-func addComment(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func handleAddComment(w http.ResponseWriter, r *http.Request) {
+	reqID, _ := r.Context().Value("request_id").(string)
+	// Читаем тело комментария
+	var commentData map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&commentData); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	// Отправляем POST запрос в CommentsService
-	// Мы просто передаем r.Body дальше
-	resp, err := http.Post("http://localhost:8081/comments", "application/json", r.Body)
+
+	// Превращаем обратно в байты для отправки в сервисы
+	bodyBytes, _ := json.Marshal(commentData)
+
+	// СИНХРОННЫЙ ЗАПРОС К ЦЕНЗОРУ
+	censorURL := fmt.Sprintf("http://localhost:8082/censor?request_id=%s", reqID)
+	// Создаем новый запрос, так как r.Body уже прочитан
+	censorResp, err := http.Post(censorURL, "application/json", strings.NewReader(string(bodyBytes)))
+
+	if err != nil || censorResp.StatusCode != http.StatusOK {
+		http.Error(w, "Comment failed censorship", http.StatusBadRequest)
+		return
+	}
+
+	// ЕСЛИ ЦЕНЗОР ОДОБРИЛ (200 OK) — ОТПРАВЛЯЕМ В СЕРВИС КОММЕНТАРИЕВ
+	commentsURL := fmt.Sprintf("%s/comments?request_id=%s", cfg.CommentsService, reqID)
+	resp, err := http.Post(commentsURL, "application/json", strings.NewReader(string(bodyBytes)))
 	if err != nil {
-		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		http.Error(w, "Comments service unreachable", http.StatusServiceUnavailable)
 		return
 	}
 	defer resp.Body.Close()
-	// Теперь нужно прочитать ответ от сервиса и отдать его пользователю
-	var result map[string]any
-	json.NewDecoder(resp.Body).Decode(&result)
 
-	writeJSON(w, result)
+	var res map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&res)
+	writeJSON(w, res)
 }
 
-// функция ответа
 func writeJSON(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	_ = json.NewEncoder(w).Encode(data)
+	json.NewEncoder(w).Encode(data)
 }
 
-//  http сервер
-
 func main() {
-	http.HandleFunc("/news", getNewsList)
-	http.HandleFunc("/news/filter", filterNews)
-	http.HandleFunc("/news/detail", getNewsDetail)
-	http.HandleFunc("/comment/add", addComment)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/news", handleNews)
+	mux.HandleFunc("/news/detail", getNewsDetail)
+	mux.HandleFunc("/comment/add", handleAddComment)
+
+	wrappedMux := loggerMiddleware(mux)
 
 	fmt.Println("API Gateway запущен на http://localhost:8080")
-	http.ListenAndServe(":8080", nil)
+	log.Fatal(http.ListenAndServe(":8080", wrappedMux))
 }
